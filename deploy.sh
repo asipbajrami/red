@@ -110,19 +110,81 @@ $COMPOSE_CMD
 echo "==> Waiting for services to be healthy..."
 MAX_RETRIES=30
 RETRY_INTERVAL=10
+HEALTH_SERVICES=(frontend backend nginx db)
 
 for i in $(seq 1 $MAX_RETRIES); do
-  UNHEALTHY=$(docker compose --env-file "$BACKEND_ENV" -f "$COMPOSE_FILE" ps --format json 2>/dev/null | grep -c '"Health":"starting"' || true)
+  STATUS_JSON=$(docker compose --env-file "$BACKEND_ENV" -f "$COMPOSE_FILE" ps --format json "${HEALTH_SERVICES[@]}" 2>/dev/null || true)
 
-  if [[ "$UNHEALTHY" -eq 0 ]]; then
+  if [[ -z "$STATUS_JSON" ]]; then
+    echo "  Waiting for Docker Compose status output... ($i/$MAX_RETRIES)"
+    sleep "$RETRY_INTERVAL"
+    continue
+  fi
+
+  if STATUS_JSON="$STATUS_JSON" python3 - <<'PY'
+import json
+import os
+import sys
+
+raw = os.environ.get("STATUS_JSON", "").strip()
+if not raw:
+    print("missing")
+    sys.exit(2)
+
+try:
+    data = json.loads(raw)
+    if isinstance(data, dict):
+        data = [data]
+except json.JSONDecodeError:
+    data = [json.loads(line) for line in raw.splitlines() if line.strip()]
+
+required = {"frontend", "backend", "nginx", "db"}
+services = {item.get("Service"): item for item in data if item.get("Service")}
+missing = sorted(required - services.keys())
+
+if missing:
+    print("missing:" + ",".join(missing))
+    sys.exit(2)
+
+for name in required:
+    state = services[name].get("State")
+    health = services[name].get("Health", "")
+    if state != "running":
+        print(f"state:{name}:{state}")
+        sys.exit(3)
+    if health and health != "healthy":
+        print(f"health:{name}:{health}")
+        sys.exit(4)
+
+print("healthy")
+PY
+  then
+    CHECK_STATUS=0
+  else
+    CHECK_STATUS=$?
+  fi
+
+  if [[ "$CHECK_STATUS" -eq 0 ]]; then
     echo "  All services healthy"
     break
   fi
 
-  if [[ "$i" -eq "$MAX_RETRIES" ]]; then
-    echo "  Warning: some services may not be healthy after ${MAX_RETRIES} retries"
+  if [[ "$CHECK_STATUS" -eq 3 || "$CHECK_STATUS" -eq 4 ]]; then
+    echo "Error: one or more services failed to reach a healthy running state"
     docker compose --env-file "$BACKEND_ENV" -f "$COMPOSE_FILE" ps
-    break
+    echo ""
+    echo "Recent logs:"
+    docker compose --env-file "$BACKEND_ENV" -f "$COMPOSE_FILE" logs --tail=200 frontend backend nginx db || true
+    exit 1
+  fi
+
+  if [[ "$i" -eq "$MAX_RETRIES" ]]; then
+    echo "Error: services did not become healthy after ${MAX_RETRIES} retries"
+    docker compose --env-file "$BACKEND_ENV" -f "$COMPOSE_FILE" ps
+    echo ""
+    echo "Recent logs:"
+    docker compose --env-file "$BACKEND_ENV" -f "$COMPOSE_FILE" logs --tail=200 frontend backend nginx db || true
+    exit 1
   fi
 
   echo "  Waiting... ($i/$MAX_RETRIES)"

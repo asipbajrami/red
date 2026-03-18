@@ -35,8 +35,12 @@ sync_repo() {
 
   if [[ -d "$repo_path/.git" ]]; then
     echo "Pulling $repo_path"
+    if [[ -n "$(git -C "$repo_path" status --porcelain)" ]]; then
+      echo "Error: $repo_path has uncommitted changes; aborting deploy sync"
+      exit 1
+    fi
     git -C "$repo_path" pull --ff-only
-    rm -rf "$repo_path/.next"
+    rm -rf "$repo_path/.next" 2>/dev/null || true
     return
   fi
 
