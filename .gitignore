@@ -1,3 +1,4 @@
-apps/
+apps/*
+!apps/.gitkeep
 pgdata
 certs/
