@@ -63,12 +63,17 @@ fi
 if grep -q "^APP_KEY=$" "$BACKEND_ENV"; then
   echo "==> Generating APP_KEY..."
   APP_KEY=$(docker run --rm php:8.3-cli php -r "echo 'base64:' . base64_encode(random_bytes(32));")
-  APP_KEY="$APP_KEY" php -r '
-    $file = $argv[1];
-    $contents = file_get_contents($file);
-    $contents = preg_replace("/^APP_KEY=$/m", "APP_KEY=" . getenv("APP_KEY"), $contents, 1);
-    file_put_contents($file, $contents);
-  ' "$BACKEND_ENV"
+  TMP_ENV=$(mktemp)
+  awk -v app_key="$APP_KEY" '
+    BEGIN { replaced = 0 }
+    /^APP_KEY=$/ && !replaced {
+      print "APP_KEY=" app_key
+      replaced = 1
+      next
+    }
+    { print }
+  ' "$BACKEND_ENV" > "$TMP_ENV"
+  mv "$TMP_ENV" "$BACKEND_ENV"
 fi
 
 echo "==> Syncing app repos..."
