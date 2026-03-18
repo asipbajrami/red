@@ -1,0 +1,7 @@
+apps/*/node_modules
+apps/*/.next
+apps/*/vendor
+apps/*/.env
+apps/*/.env.local
+pgdata
+certs/
