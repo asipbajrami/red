@@ -61,19 +61,8 @@ if grep -q "CHANGE_ME" "$BACKEND_ENV"; then
 fi
 
 if grep -q "^APP_KEY=$" "$BACKEND_ENV"; then
-  echo "==> Generating APP_KEY..."
-  APP_KEY=$(docker run --rm php:8.3-cli php -r "echo 'base64:' . base64_encode(random_bytes(32));")
-  TMP_ENV=$(mktemp)
-  awk -v app_key="$APP_KEY" '
-    BEGIN { replaced = 0 }
-    /^APP_KEY=$/ && !replaced {
-      print "APP_KEY=" app_key
-      replaced = 1
-      next
-    }
-    { print }
-  ' "$BACKEND_ENV" > "$TMP_ENV"
-  mv "$TMP_ENV" "$BACKEND_ENV"
+  echo "Error: APP_KEY is not set in $BACKEND_ENV"
+  exit 1
 fi
 
 echo "==> Syncing app repos..."
