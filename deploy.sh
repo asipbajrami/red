@@ -43,6 +43,47 @@ APPS=(
   "$FRONTEND_APP_DIR"
   "$BACKEND_APP_DIR"
 )
+COMPOSE_ARGS=(--env-file "$BACKEND_ENV" -f "$COMPOSE_FILE")
+
+compose_prod() {
+  docker compose "${COMPOSE_ARGS[@]}" "$@"
+}
+
+print_recent_logs() {
+  echo ""
+  echo "Recent logs:"
+  compose_prod logs --tail=200 frontend backend nginx db || true
+}
+
+check_service() {
+  local service="$1"
+  local container_id
+  local state
+  local health
+
+  container_id="$(compose_prod ps -q "$service" | head -n 1)"
+
+  if [[ -z "$container_id" ]]; then
+    echo "missing:$service"
+    return 2
+  fi
+
+  state="$(docker inspect --format '{{.State.Status}}' "$container_id" 2>/dev/null || true)"
+
+  if [[ "$state" != "running" ]]; then
+    echo "state:$service:${state:-missing}"
+    return 3
+  fi
+
+  health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container_id" 2>/dev/null || true)"
+
+  if [[ -n "$health" && "$health" != "healthy" ]]; then
+    echo "health:$service:$health"
+    return 4
+  fi
+
+  return 0
+}
 
 if [[ ! -f "$COMPOSE_FILE" ]]; then
   echo "Error: $COMPOSE_FILE not found"
@@ -98,14 +139,15 @@ sed \
   -e "s|__SSL_KEY_FILENAME__|$SSL_KEY_FILENAME|g" \
   "$NGINX_TEMPLATE" > "$NGINX_CONFIG"
 
-COMPOSE_CMD="docker compose --env-file $BACKEND_ENV -f $COMPOSE_FILE up -d --build"
+COMPOSE_UP_ARGS=(up -d --build)
 
 if [[ -n "$SERVICES" ]]; then
-  COMPOSE_CMD="$COMPOSE_CMD ${SERVICES//,/ }"
+  read -r -a SELECTED_SERVICES <<< "${SERVICES//,/ }"
+  COMPOSE_UP_ARGS+=("${SELECTED_SERVICES[@]}")
 fi
 
-echo "==> Running: $COMPOSE_CMD"
-$COMPOSE_CMD
+echo "==> Running: docker compose ${COMPOSE_ARGS[*]} ${COMPOSE_UP_ARGS[*]}"
+compose_prod "${COMPOSE_UP_ARGS[@]}"
 
 echo "==> Waiting for services to be healthy..."
 MAX_RETRIES=30
@@ -113,77 +155,34 @@ RETRY_INTERVAL=10
 HEALTH_SERVICES=(frontend backend nginx db)
 
 for i in $(seq 1 $MAX_RETRIES); do
-  STATUS_JSON=$(docker compose --env-file "$BACKEND_ENV" -f "$COMPOSE_FILE" ps --format json "${HEALTH_SERVICES[@]}" 2>/dev/null || true)
+  PENDING=false
 
-  if [[ -z "$STATUS_JSON" ]]; then
-    echo "  Waiting for Docker Compose status output... ($i/$MAX_RETRIES)"
-    sleep "$RETRY_INTERVAL"
-    continue
-  fi
+  for service in "${HEALTH_SERVICES[@]}"; do
+    if RESULT="$(check_service "$service")"; then
+      continue
+    fi
 
-  if STATUS_JSON="$STATUS_JSON" python3 - <<'PY'
-import json
-import os
-import sys
-
-raw = os.environ.get("STATUS_JSON", "").strip()
-if not raw:
-    print("missing")
-    sys.exit(2)
-
-try:
-    data = json.loads(raw)
-    if isinstance(data, dict):
-        data = [data]
-except json.JSONDecodeError:
-    data = [json.loads(line) for line in raw.splitlines() if line.strip()]
-
-required = {"frontend", "backend", "nginx", "db"}
-services = {item.get("Service"): item for item in data if item.get("Service")}
-missing = sorted(required - services.keys())
-
-if missing:
-    print("missing:" + ",".join(missing))
-    sys.exit(2)
-
-for name in required:
-    state = services[name].get("State")
-    health = services[name].get("Health", "")
-    if state != "running":
-        print(f"state:{name}:{state}")
-        sys.exit(3)
-    if health and health != "healthy":
-        print(f"health:{name}:{health}")
-        sys.exit(4)
-
-print("healthy")
-PY
-  then
-    CHECK_STATUS=0
-  else
     CHECK_STATUS=$?
-  fi
 
-  if [[ "$CHECK_STATUS" -eq 0 ]]; then
+    if [[ "$CHECK_STATUS" -eq 3 || "$CHECK_STATUS" -eq 4 ]]; then
+      echo "Error: ${RESULT:-$service} failed to reach a healthy running state"
+      compose_prod ps
+      print_recent_logs
+      exit 1
+    fi
+
+    PENDING=true
+  done
+
+  if [[ "$PENDING" == false ]]; then
     echo "  All services healthy"
     break
   fi
 
-  if [[ "$CHECK_STATUS" -eq 3 || "$CHECK_STATUS" -eq 4 ]]; then
-    echo "Error: one or more services failed to reach a healthy running state"
-    docker compose --env-file "$BACKEND_ENV" -f "$COMPOSE_FILE" ps
-    echo ""
-    echo "Recent logs:"
-    docker compose --env-file "$BACKEND_ENV" -f "$COMPOSE_FILE" logs --tail=200 frontend backend nginx db || true
-    exit 1
-  fi
-
   if [[ "$i" -eq "$MAX_RETRIES" ]]; then
     echo "Error: services did not become healthy after ${MAX_RETRIES} retries"
-    docker compose --env-file "$BACKEND_ENV" -f "$COMPOSE_FILE" ps
-    echo ""
-    echo "Recent logs:"
-    docker compose --env-file "$BACKEND_ENV" -f "$COMPOSE_FILE" logs --tail=200 frontend backend nginx db || true
+    compose_prod ps
+    print_recent_logs
     exit 1
   fi
 
@@ -193,17 +192,17 @@ done
 
 if [[ "$MIGRATE" == true ]]; then
   echo "==> Running database migrations..."
-  docker compose --env-file "$BACKEND_ENV" -f "$COMPOSE_FILE" exec backend php artisan migrate --force
+  compose_prod exec backend php artisan migrate --force
 fi
 
 if [[ "$SEED" == true ]]; then
   echo "==> Running database seeders..."
-  docker compose --env-file "$BACKEND_ENV" -f "$COMPOSE_FILE" exec backend php artisan db:seed --force
+  compose_prod exec backend php artisan db:seed --force
 fi
 
 echo "==> Clearing application cache..."
-docker compose --env-file "$BACKEND_ENV" -f "$COMPOSE_FILE" exec backend php artisan cache:clear
+compose_prod exec backend php artisan cache:clear
 
 echo ""
 echo "==> Deployment complete"
-docker compose --env-file "$BACKEND_ENV" -f "$COMPOSE_FILE" ps
+compose_prod ps
